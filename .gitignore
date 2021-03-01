@@ -134,3 +134,6 @@ dmypy.json
 # Unity
 unity-environment.log
 Tennis_Linux/
+
+# Doc files
+*.odt
