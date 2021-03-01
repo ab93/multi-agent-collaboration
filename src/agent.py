@@ -21,7 +21,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("\nDevice:", device)
 
 
-class Agent():
+class Agent:
     """Interacts with and learns from the environment."""
 
     def __init__(self, state_size, action_size, num_agents, random_seed):
@@ -31,6 +31,7 @@ class Agent():
         ======
             state_size (int): dimension of each state
             action_size (int): dimension of each action
+            num_agents (int): Number of agents in the env
             random_seed (int): random seed
         """
         self.state_size = state_size
@@ -135,7 +136,8 @@ class Agent():
         self.soft_update(self.critic_local, self.critic_target, TAU)
         self.soft_update(self.actor_local, self.actor_target, TAU)
 
-    def soft_update(self, local_model, target_model, tau):
+    @classmethod
+    def soft_update(cls, local_model, target_model, tau):
         """Soft update model parameters.
         θ_target = τ*θ_local + (1 - τ)*θ_target
 
@@ -147,6 +149,82 @@ class Agent():
         """
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
             target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+
+
+class DoubleCoopAgent(Agent):
+    """Interacts with and learns from the environment."""
+
+    def __init__(self, state_size, action_size, random_seed):
+        """Initialize an Agent object.
+
+        Params
+        ======
+            state_size (int): dimension of each state
+            action_size (int): dimension of each action
+            random_seed (int): random seed
+        """
+        super().__init__(state_size, action_size, 2, random_seed)
+        self.memory = ReplayBufferDoubleAgent(action_size, BUFFER_SIZE, BATCH_SIZE, random_seed)
+
+    def step(self, states, actions_p1, rewards, next_states_p1, is_dones):
+        """Save experience in replay memory, and use random sample from buffer to learn."""
+        # Save experience / reward
+
+        actions_p2 = np.flipud(actions_p1)
+        next_states_p2 = np.flipud(next_states_p1)
+
+        for state, action_p1, action_p2, reward, next_state_p1, next_state_p2, is_done in \
+                zip(states, actions_p1, actions_p2, rewards, next_states_p1, next_states_p2, is_dones):
+            self.memory.add(state, action_p1, action_p2, reward, next_state_p1, next_state_p2, is_done)
+
+        # Learn, if enough samples are available in memory
+        if len(self.memory) > BATCH_SIZE:
+            experiences = self.memory.sample()
+            self.learn(experiences, GAMMA)
+
+    def learn(self, experiences, gamma):
+        """Update policy and value parameters using given batch of experience tuples.
+        Q_targets = r + γ * critic_target(next_state, actor_target(next_state), actor_target(next_state_other_player))
+        where:
+            actor_target(state) -> action
+            critic_target(state, action, action) -> Q-value
+        Params
+        ======
+            experiences (Tuple[torch.Tensor]): tuple of (s, a, a_2, r, s', s'_2, done) tuples
+            gamma (float): discount factor
+        """
+        states, actions_p1, actions_p2, rewards, next_states_p1, next_states_p2, dones = experiences
+
+        # ---------------------------- update critic ---------------------------- #
+        # Get predicted next-state actions (also for the other player) and Q values from target models
+        actions_next_p1 = self.actor_target(next_states_p1)
+        actions_next_p2 = self.actor_target(next_states_p2)
+        Q_targets_next = self.critic_target(next_states_p1, actions_next_p1, actions_next_p2)
+        # Compute Q targets for current states (y_i)
+        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
+        # Current expected Q-values
+        Q_expected = self.critic_local(states, actions_p1, actions_p2)
+        # Compute critic loss
+        critic_loss = F.mse_loss(Q_expected, Q_targets)
+        # Minimize the loss
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), 1)
+        self.critic_optimizer.step()
+
+        # ---------------------------- update actor ---------------------------- #
+        # Compute actor loss
+        actions_pred_p1 = self.actor_local(states)
+        actor_loss = -self.critic_local(states, actions_pred_p1, actions_p2).mean()
+        # Minimize the loss
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # ----------------------- update target networks ----------------------- #
+        self.soft_update(self.critic_local, self.critic_target, TAU)
+        self.soft_update(self.actor_local, self.actor_target, TAU)
 
 
 class OUNoise:
@@ -188,7 +266,7 @@ class ReplayBuffer:
         self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
         self.seed = random.seed(seed)
 
-    def add(self, state, action, reward, next_state, done):
+    def add(self, state, action, reward, next_state, done, *_):
         """Add a new experience to memory."""
         e = self.experience(state, action, reward, next_state, done)
         self.memory.append(e)
@@ -205,8 +283,46 @@ class ReplayBuffer:
         dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(
             device)
 
-        return (states, actions, rewards, next_states, dones)
+        return states, actions, rewards, next_states, dones
 
     def __len__(self):
         """Return the current size of internal memory."""
         return len(self.memory)
+
+
+class ReplayBufferDoubleAgent(ReplayBuffer):
+    def __init__(self, action_size, buffer_size, batch_size, seed):
+        super(ReplayBufferDoubleAgent, self).__init__(action_size, buffer_size, batch_size, seed)
+        self.experience = namedtuple("Experience",
+                                     field_names=["state", "action_p1", "action_p2", "reward",
+                                                  "next_state_p1", "next_state_p2", "done"])
+
+    def add(self, *info):
+        """Add a new experience to memory."""
+        state, action_p1, action_p2, reward, next_state_p1, next_state_p2, done = info
+        exp = self.experience(state, action_p1, action_p2, reward, next_state_p1, next_state_p2, done)
+        self.memory.append(exp)
+
+    def sample(self):
+        """Randomly sample a batch of experiences from memory."""
+        experiences = random.sample(self.memory, k=self.batch_size)
+
+        states = torch.from_numpy(np.vstack([e.state
+                                             for e in experiences if e is not None])).float().to(device)
+        actions_p1 = torch.from_numpy(np.vstack([e.action_p1
+                                                 for e in experiences if e is not None])).float().to(device)
+        actions_p2 = torch.from_numpy(np.vstack([e.action_p2
+                                                 for e in experiences if e is not None])).float().to(device)
+        rewards = torch.from_numpy(np.vstack([e.reward
+                                              for e in experiences if e is not None])).float().to(device)
+        next_states_p1 = torch.from_numpy(np.vstack([e.next_state_p1
+                                                     for e in experiences
+                                                     if e is not None])).float().to(device)
+        next_states_p2 = torch.from_numpy(np.vstack([e.next_state_p2
+                                                     for e in experiences
+                                                     if e is not None])).float().to(device)
+        dones = torch.from_numpy(np.vstack([e.done
+                                            for e in experiences
+                                            if e is not None]).astype(np.uint8)).float().to(device)
+
+        return states, actions_p1, actions_p2, rewards, next_states_p1, next_states_p2, dones
